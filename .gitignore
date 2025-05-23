@@ -1,0 +1,27 @@
+# MAMP/Server files
+.DS_Store
+Thumbs.db
+
+# Sensitive files
+config/database.php
+config/config.php
+.env
+*.env
+
+# Database files
+*.sql
+*.db
+
+# Uploads (keep structure, ignore content)
+uploads/documents/*
+uploads/receipts/*
+uploads/temp/*
+
+# Logs and cache
+logs/
+cache/
+temp/
+
+# IDE files
+.vscode/
+.idea/

@@ -1,0 +1,858 @@
+<?php
+/**
+ * Detailed Approval Review
+ * File: approvals/approve-request.php
+ */
+
+require_once '../config/config.php';
+require_once '../includes/session.php';
+require_once '../classes/Request.php';
+require_once '../classes/Approval.php';
+
+// Ensure user is director
+requireRole([ROLE_DIRECTOR]);
+
+$requestId = intval($_GET['id'] ?? 0);
+$currentUser = getCurrentUser();
+
+if (!$requestId) {
+    setFlashMessage(MSG_ERROR, 'Invalid request ID.');
+    header('Location: pending-approvals.php');
+    exit();
+}
+
+$request = new Request();
+$requestData = $request->getById($requestId, $currentUser['id']);
+
+if (!$requestData) {
+    setFlashMessage(MSG_ERROR, 'Request not found or access denied.');
+    header('Location: pending-approvals.php');
+    exit();
+}
+
+// Check if user can approve this request
+$approval = new Approval();
+$db = new Database();
+
+$approvalRecord = $db->select('request_approvals', 
+    'request_id = :request_id AND approver_id = :approver_id', 
+    [':request_id' => $requestId, ':approver_id' => $currentUser['id']]
+);
+
+if (empty($approvalRecord)) {
+    setFlashMessage(MSG_ERROR, 'You are not assigned to approve this request.');
+    header('Location: pending-approvals.php');
+    exit();
+}
+
+$myApproval = $approvalRecord[0];
+
+// Check if already decided
+if ($myApproval['status'] !== APPROVAL_PENDING) {
+    setFlashMessage(MSG_INFO, 'You have already made a decision on this request.');
+    header('Location: ../requests/view-request.php?id=' . $requestId);
+    exit();
+}
+
+// Check if request is still pending
+if ($requestData['status'] !== STATUS_PENDING) {
+    setFlashMessage(MSG_INFO, 'This request is no longer pending approval.');
+    header('Location: ../requests/view-request.php?id=' . $requestId);
+    exit();
+}
+
+// Handle form submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        setFlashMessage(MSG_ERROR, 'Invalid security token. Please try again.');
+    } else {
+        $decision = sanitize($_POST['decision'] ?? '');
+        $comments = sanitize($_POST['comments'] ?? '');
+        
+        if (!in_array($decision, ['approved', 'rejected'])) {
+            setFlashMessage(MSG_ERROR, 'Invalid decision.');
+        } elseif ($decision === 'rejected' && empty(trim($comments))) {
+            setFlashMessage(MSG_ERROR, 'Comments are required for rejection.');
+        } else {
+            $result = $approval->processDecision($requestId, $currentUser['id'], $decision, $comments);
+            
+            if ($result['success']) {
+                $actionText = $decision === 'approved' ? 'approved' : 'rejected';
+                setFlashMessage(MSG_SUCCESS, "Request successfully {$actionText}!");
+                header('Location: pending-approvals.php');
+                exit();
+            } else {
+                setFlashMessage(MSG_ERROR, $result['message']);
+            }
+        }
+    }
+}
+
+$pageTitle = 'Approve Request #' . $requestData['request_number'];
+
+// Get similar requests for context
+$similarRequestsQuery = "
+    SELECT id, title, amount, status, created_at, request_number
+    FROM financial_requests 
+    WHERE user_id = :user_id 
+    AND id != :current_id 
+    AND request_type_id = :type_id
+    ORDER BY created_at DESC 
+    LIMIT 5
+";
+$db->query($similarRequestsQuery);
+$db->bind(':user_id', $requestData['user_id']);
+$db->bind(':current_id', $requestData['id']);
+$db->bind(':type_id', $requestData['request_type_id']);
+$similarRequests = $db->resultSet();
+
+$csrfToken = generateCSRFToken();
+
+include '../includes/header.php';
+?>
+
+<div class="content-header">
+    <div class="d-flex justify-content-between align-items-start">
+        <div>
+            <h1><i class="fas fa-gavel me-2"></i>Review for Approval</h1>
+            <p class="mb-0">
+                Request #<?php echo e($requestData['request_number']); ?> • 
+                <?php echo getUrgencyBadge($requestData['urgency']); ?> • 
+                Amount: <strong><?php echo formatCurrency($requestData['amount']); ?></strong>
+            </p>
+        </div>
+        <div class="btn-group">
+            <a href="pending-approvals.php" class="btn btn-outline-secondary">
+                <i class="fas fa-arrow-left me-1"></i>Back to Pending
+            </a>
+            <a href="../requests/view-request.php?id=<?php echo $requestData['id']; ?>" class="btn btn-outline-primary">
+                <i class="fas fa-eye me-1"></i>Full Details
+            </a>
+        </div>
+    </div>
+</div>
+
+<div class="content-body">
+    <div class="row">
+        <!-- Main Approval Form -->
+        <div class="col-lg-8">
+            <!-- Request Summary -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-file-invoice-dollar text-primary me-2"></i>Request Summary
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h4 class="text-primary"><?php echo e($requestData['title']); ?></h4>
+                            <p class="text-muted mb-3"><?php echo e($requestData['type_name']); ?></p>
+                            
+                            <dl class="row">
+                                <dt class="col-sm-4">Requested by:</dt>
+                                <dd class="col-sm-8"><?php echo e($requestData['first_name'] . ' ' . $requestData['last_name']); ?></dd>
+                                
+                                <dt class="col-sm-4">Business:</dt>
+                                <dd class="col-sm-8"><?php echo e($requestData['business_name']); ?></dd>
+                                
+                                <dt class="col-sm-4">Date Submitted:</dt>
+                                <dd class="col-sm-8"><?php echo formatDate($requestData['created_at'], DISPLAY_DATETIME_FORMAT); ?></dd>
+                                
+                                <?php if ($requestData['required_by_date']): ?>
+                                <dt class="col-sm-4">Required by:</dt>
+                                <dd class="col-sm-8">
+                                    <?php echo formatDate($requestData['required_by_date']); ?>
+                                    <?php
+                                    $daysUntil = ceil((strtotime($requestData['required_by_date']) - time()) / 86400);
+                                    if ($daysUntil < 0): ?>
+                                        <span class="badge bg-danger ms-2">Overdue</span>
+                                    <?php elseif ($daysUntil <= 7): ?>
+                                        <span class="badge bg-warning text-dark ms-2"><?php echo $daysUntil; ?> days remaining</span>
+                                    <?php endif; ?>
+                                </dd>
+                                <?php endif; ?>
+                            </dl>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="text-center">
+                                <div class="display-4 text-primary fw-bold"><?php echo formatCurrency($requestData['amount']); ?></div>
+                                <div class="text-muted">Requested Amount</div>
+                                
+                                <?php if ($requestData['workflow']): ?>
+                                <div class="mt-3">
+                                    <small class="text-muted">
+                                        <?php if ($requestData['workflow']['auto_approve_threshold'] && $requestData['amount'] <= $requestData['workflow']['auto_approve_threshold']): ?>
+                                            <i class="fas fa-robot text-success"></i> Auto-approval eligible
+                                        <?php else: ?>
+                                            <i class="fas fa-users text-info"></i> Requires <?php echo $requestData['workflow']['required_approvers']; ?> approval(s)
+                                        <?php endif; ?>
+                                    </small>
+                                </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-4">
+                        <h6>Description:</h6>
+                        <div class="p-3 bg-light rounded">
+                            <?php echo nl2br(e($requestData['description'])); ?>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Supporting Documents -->
+            <?php if (!empty($requestData['documents'])): ?>
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-paperclip text-info me-2"></i>Supporting Documents
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <?php foreach ($requestData['documents'] as $document): ?>
+                        <div class="col-md-6 mb-3">
+                            <div class="document-item d-flex align-items-center p-3 border rounded">
+                                <div class="document-icon me-3">
+                                    <?php
+                                    $extension = strtolower(pathinfo($document['document_name'], PATHINFO_EXTENSION));
+                                    $iconClass = match($extension) {
+                                        'pdf' => 'fas fa-file-pdf text-danger',
+                                        'doc', 'docx' => 'fas fa-file-word text-primary',
+                                        'xls', 'xlsx' => 'fas fa-file-excel text-success',
+                                        'jpg', 'jpeg', 'png' => 'fas fa-file-image text-info',
+                                        default => 'fas fa-file text-secondary'
+                                    };
+                                    ?>
+                                    <i class="<?php echo $iconClass; ?> fa-2x"></i>
+                                </div>
+                                <div class="document-info flex-grow-1">
+                                    <div class="fw-bold"><?php echo e($document['document_name']); ?></div>
+                                    <div class="small text-muted">
+                                        <?php echo formatFileSize($document['file_size']); ?> • 
+                                        <?php echo timeAgo($document['uploaded_at']); ?>
+                                    </div>
+                                </div>
+                                <div class="document-actions">
+                                    <a href="../requests/download-document.php?id=<?php echo $document['id']; ?>" 
+                                       class="btn btn-sm btn-outline-primary" 
+                                       data-bs-toggle="tooltip" 
+                                       title="Download">
+                                        <i class="fas fa-download"></i>
+                                    </a>
+                                    <?php if (in_array($extension, ['jpg', 'jpeg', 'png', 'pdf'])): ?>
+                                    <button class="btn btn-sm btn-outline-info ms-1" 
+                                            onclick="previewDocument('<?php echo e($document['document_name']); ?>', '<?php echo $document['id']; ?>')"
+                                            data-bs-toggle="tooltip" 
+                                            title="Preview">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Approval Decision Form -->
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-decision text-warning me-2"></i>Your Decision
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST" id="approvalForm">
+                        <input type="hidden" name="csrf_token" value="<?php echo $csrfToken; ?>">
+                        
+                        <!-- Decision Radio Buttons -->
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Decision <span class="text-danger">*</span></label>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="card decision-card" onclick="selectDecision('approved')">
+                                        <div class="card-body text-center">
+                                            <input type="radio" name="decision" value="approved" id="approve" class="form-check-input d-none">
+                                            <i class="fas fa-check-circle fa-3x text-success mb-2"></i>
+                                            <h5 class="card-title text-success">Approve</h5>
+                                            <p class="card-text small">Authorize this financial request</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="card decision-card" onclick="selectDecision('rejected')">
+                                        <div class="card-body text-center">
+                                            <input type="radio" name="decision" value="rejected" id="reject" class="form-check-input d-none">
+                                            <i class="fas fa-times-circle fa-3x text-danger mb-2"></i>
+                                            <h5 class="card-title text-danger">Reject</h5>
+                                            <p class="card-text small">Deny this financial request</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Comments -->
+                        <div class="mb-4">
+                            <label for="comments" class="form-label">Comments <span id="commentsRequired" class="text-danger" style="display: none;">*</span></label>
+                            <textarea class="form-control" id="comments" name="comments" rows="4" 
+                                      placeholder="Add your comments about this decision (required for rejections)"></textarea>
+                            <div class="form-text">
+                                <span id="commentsCount">0</span>/1000 characters
+                            </div>
+                        </div>
+                        
+                        <!-- Submit Buttons -->
+                        <div class="d-flex justify-content-between">
+                            <a href="pending-approvals.php" class="btn btn-secondary">
+                                <i class="fas fa-arrow-left me-2"></i>Back to Pending
+                            </a>
+                            <button type="submit" class="btn btn-lg btn-primary" id="submitBtn" disabled>
+                                <i class="fas fa-gavel me-2"></i>Submit Decision
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Sidebar -->
+        <div class="col-lg-4">
+            <!-- Approval Progress -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-tasks text-info me-2"></i>Approval Progress
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <?php if (empty($requestData['approvals'])): ?>
+                        <div class="text-center">
+                            <i class="fas fa-robot fa-2x text-success mb-2"></i>
+                            <p class="mb-0">Auto-approved based on business rules</p>
+                        </div>
+                    <?php else: ?>
+                        <?php
+                        $totalApprovers = count($requestData['approvals']);
+                        $approvedCount = 0;
+                        $rejectedCount = 0;
+                        $pendingCount = 0;
+                        
+                        foreach ($requestData['approvals'] as $approvalItem) {
+                            if ($approvalItem['status'] === APPROVAL_APPROVED) $approvedCount++;
+                            elseif ($approvalItem['status'] === APPROVAL_REJECTED) $rejectedCount++;
+                            else $pendingCount++;
+                        }
+                        
+                        $progressPercentage = $totalApprovers > 0 ? ($approvedCount / $totalApprovers) * 100 : 0;
+                        ?>
+                        
+                        <div class="mb-3">
+                            <div class="d-flex justify-content-between mb-1">
+                                <span class="small">Progress</span>
+                                <span class="small"><?php echo $approvedCount; ?>/<?php echo $totalApprovers; ?> approved</span>
+                            </div>
+                            <div class="progress" style="height: 8px;">
+                                <div class="progress-bar bg-success" 
+                                     style="width: <?php echo $progressPercentage; ?>%"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="approvers-list">
+                            <?php foreach ($requestData['approvals'] as $approvalItem): ?>
+                            <div class="approver-item d-flex align-items-center mb-2 p-2 rounded <?php echo $approvalItem['approver_id'] == $currentUser['id'] ? 'bg-primary bg-opacity-10 border border-primary' : 'bg-light'; ?>">
+                                <div class="approver-avatar me-2">
+                                    <?php if ($approvalItem['status'] === APPROVAL_APPROVED): ?>
+                                        <i class="fas fa-check-circle text-success"></i>
+                                    <?php elseif ($approvalItem['status'] === APPROVAL_REJECTED): ?>
+                                        <i class="fas fa-times-circle text-danger"></i>
+                                    <?php else: ?>
+                                        <i class="fas fa-clock text-warning"></i>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="approver-info flex-grow-1">
+                                    <div class="fw-bold"><?php echo e($approvalItem['first_name'] . ' ' . $approvalItem['last_name']); ?></div>
+                                    <?php if ($approvalItem['approver_id'] == $currentUser['id']): ?>
+                                        <small class="text-primary">You</small>
+                                    <?php else: ?>
+                                        <small class="text-muted"><?php echo e($approvalItem['email']); ?></small>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="approver-status">
+                                    <?php if ($approvalItem['decision_date']): ?>
+                                        <small class="text-muted"><?php echo timeAgo($approvalItem['decision_date']); ?></small>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <!-- Request Analytics -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-chart-bar text-success me-2"></i>Request Analytics
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <?php
+                    // Calculate some analytics
+                    $waitingTime = round((time() - strtotime($requestData['created_at'])) / 3600, 1);
+                    
+                    // Get employee's request history
+                    $employeeStatsQuery = "
+                        SELECT 
+                            COUNT(*) as total_requests,
+                            AVG(amount) as avg_amount,
+                            SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved_requests
+                        FROM financial_requests 
+                        WHERE user_id = :user_id
+                    ";
+                    $db->query($employeeStatsQuery);
+                    $db->bind(':user_id', $requestData['user_id']);
+                    $employeeStats = $db->single();
+                    
+                    $approvalRate = $employeeStats['total_requests'] > 0 ? 
+                        ($employeeStats['approved_requests'] / $employeeStats['total_requests']) * 100 : 0;
+                    ?>
+                    
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Waiting time:</span>
+                        <span class="fw-bold"><?php echo $waitingTime; ?> hours</span>
+                    </div>
+                    
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Employee's total requests:</span>
+                        <span class="fw-bold"><?php echo $employeeStats['total_requests']; ?></span>
+                    </div>
+                    
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Employee's approval rate:</span>
+                        <span class="fw-bold"><?php echo round($approvalRate, 1); ?>%</span>
+                    </div>
+                    
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Employee's avg. request:</span>
+                        <span class="fw-bold"><?php echo formatCurrency($employeeStats['avg_amount'] ?? 0); ?></span>
+                    </div>
+                    
+                    <?php if ($requestData['workflow']): ?>
+                    <hr>
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Workflow type:</span>
+                        <span class="fw-bold"><?php echo ucfirst($requestData['workflow']['approval_order']); ?></span>
+                    </div>
+                    
+                    <?php if ($requestData['workflow']['max_amount']): ?>
+                    <div class="analytics-item d-flex justify-content-between mb-2">
+                        <span class="text-muted">Type limit:</span>
+                        <span class="fw-bold"><?php echo formatCurrency($requestData['workflow']['max_amount']); ?></span>
+                    </div>
+                    <?php endif; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <!-- Similar Requests -->
+            <?php if (!empty($similarRequests)): ?>
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-history text-info me-2"></i>Similar Requests
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <?php foreach ($similarRequests as $similar): ?>
+                    <div class="similar-item d-flex justify-content-between align-items-center mb-2 pb-2 border-bottom">
+                        <div>
+                            <div class="small fw-bold">
+                                <a href="../requests/view-request.php?id=<?php echo $similar['id']; ?>" class="text-decoration-none">
+                                    <?php echo e($similar['title']); ?>
+                                </a>
+                            </div>
+                            <div class="small text-muted">
+                                #<?php echo e($similar['request_number']); ?> • 
+                                <?php echo formatCurrency($similar['amount']); ?>
+                            </div>
+                        </div>
+                        <div class="text-end">
+                            <?php echo getStatusBadge($similar['status']); ?>
+                            <div class="small text-muted"><?php echo timeAgo($similar['created_at']); ?></div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Quick Actions -->
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-bolt text-warning me-2"></i>Quick Actions
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div class="d-grid gap-2">
+                        <button class="btn btn-success" onclick="quickApprove()">
+                            <i class="fas fa-check me-2"></i>Quick Approve
+                        </button>
+                        <button class="btn btn-danger" onclick="quickReject()">
+                            <i class="fas fa-times me-2"></i>Quick Reject
+                        </button>
+                        <button class="btn btn-info" onclick="requestMoreInfo()">
+                            <i class="fas fa-question-circle me-2"></i>Request More Info
+                        </button>
+                        <hr>
+                        <a href="../requests/view-request.php?id=<?php echo $requestData['id']; ?>" class="btn btn-outline-primary">
+                            <i class="fas fa-eye me-2"></i>View Full Request
+                        </a>
+                        <button class="btn btn-outline-secondary" onclick="window.print()">
+                            <i class="fas fa-print me-2"></i>Print Review
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Document Preview Modal -->
+<div class="modal fade" id="documentPreviewModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Document Preview</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="documentPreviewContent" class="text-center">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.decision-card {
+    cursor: pointer;
+    transition: all 0.3s ease;
+    border: 2px solid transparent;
+}
+
+.decision-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.decision-card.selected {
+    border-color: var(--primary-color);
+    background-color: rgba(13, 110, 253, 0.05);
+}
+
+.decision-card.selected.approve {
+    border-color: #28a745;
+    background-color: rgba(40, 167, 69, 0.05);
+}
+
+.decision-card.selected.reject {
+    border-color: #dc3545;
+    background-color: rgba(220, 53, 69, 0.05);
+}
+
+.document-item {
+    transition: all 0.2s ease;
+}
+
+.document-item:hover {
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    transform: translateY(-1px);
+}
+
+.approver-item {
+    transition: all 0.2s ease;
+}
+
+.analytics-item {
+    padding: 0.25rem 0;
+}
+
+.similar-item:last-child {
+    border-bottom: none !important;
+    margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
+}
+
+.card-header {
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
+    color: white;
+    border: none;
+}
+
+@media print {
+    .btn, .dropdown, .card-header .fas {
+        display: none !important;
+    }
+    
+    .sidebar {
+        display: none !important;
+    }
+    
+    .col-lg-8 {
+        width: 100% !important;
+    }
+}
+</style>
+
+<script>
+let selectedDecision = '';
+
+// Select decision
+function selectDecision(decision) {
+    selectedDecision = decision;
+    
+    // Clear previous selections
+    document.querySelectorAll('.decision-card').forEach(card => {
+        card.classList.remove('selected', 'approve', 'reject');
+    });
+    
+    // Mark selected card
+    const selectedCard = document.querySelector(`input[value="${decision}"]`).closest('.decision-card');
+    selectedCard.classList.add('selected', decision === 'approved' ? 'approve' : 'reject');
+    
+    // Check the radio button
+    document.querySelector(`input[value="${decision}"]`).checked = true;
+    
+    // Show/hide comments requirement
+    const commentsRequired = document.getElementById('commentsRequired');
+    const commentsTextarea = document.getElementById('comments');
+    
+    if (decision === 'rejected') {
+        commentsRequired.style.display = 'inline';
+        commentsTextarea.setAttribute('required', '');
+        commentsTextarea.placeholder = 'Please provide a reason for rejecting this request (required)';
+    } else {
+        commentsRequired.style.display = 'none';
+        commentsTextarea.removeAttribute('required');
+        commentsTextarea.placeholder = 'Add your comments about this approval decision (optional)';
+    }
+    
+    // Enable submit button
+    updateSubmitButton();
+}
+
+// Update submit button state
+function updateSubmitButton() {
+    const submitBtn = document.getElementById('submitBtn');
+    const commentsTextarea = document.getElementById('comments');
+    
+    let canSubmit = selectedDecision !== '';
+    
+    // If rejecting, require comments
+    if (selectedDecision === 'rejected') {
+        canSubmit = canSubmit && commentsTextarea.value.trim() !== '';
+    }
+    
+    submitBtn.disabled = !canSubmit;
+    
+    if (canSubmit) {
+        const actionText = selectedDecision === 'approved' ? 'Approve Request' : 'Reject Request';
+        const iconClass = selectedDecision === 'approved' ? 'fas fa-check' : 'fas fa-times';
+        const btnClass = selectedDecision === 'approved' ? 'btn-success' : 'btn-danger';
+        
+        submitBtn.className = `btn btn-lg ${btnClass}`;
+        submitBtn.innerHTML = `<i class="${iconClass} me-2"></i>${actionText}`;
+    } else {
+        submitBtn.className = 'btn btn-lg btn-primary';
+        submitBtn.innerHTML = '<i class="fas fa-gavel me-2"></i>Submit Decision';
+    }
+}
+
+// Quick approve
+function quickApprove() {
+    selectDecision('approved');
+    document.getElementById('comments').value = 'Approved via quick action';
+    document.getElementById('comments').focus();
+}
+
+// Quick reject
+function quickReject() {
+    selectDecision('rejected');
+    document.getElementById('comments').focus();
+}
+
+// Request more information
+function requestMoreInfo() {
+    const message = prompt('What additional information do you need from the employee?');
+    if (!message || !message.trim()) return;
+    
+    fetch('approval-handler.php', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            action: 'request_info',
+            request_id: <?php echo $requestData['id']; ?>,
+            message: message
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('Information request sent to employee.');
+        } else {
+            alert('Error: ' + data.message);
+        }
+    })
+    .catch(error => {
+        alert('An error occurred.');
+        console.error('Error:', error);
+    });
+}
+
+// Preview document
+function previewDocument(filename, documentId) {
+    const modal = new bootstrap.Modal(document.getElementById('documentPreviewModal'));
+    const content = document.getElementById('documentPreviewContent');
+    
+    content.innerHTML = `
+        <div class="spinner-border" role="status">
+            <span class="visually-hidden">Loading...</span>
+        </div>
+        <p class="mt-2">Loading ${filename}...</p>
+    `;
+    
+    modal.show();
+    
+    fetch(`../requests/preview-document.php?id=${documentId}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                if (data.type === 'image') {
+                    content.innerHTML = `<img src="${data.url}" class="img-fluid" alt="${filename}">`;
+                } else if (data.type === 'pdf') {
+                    content.innerHTML = `<iframe src="${data.url}" width="100%" height="500px" frameborder="0"></iframe>`;
+                } else {
+                    content.innerHTML = `<p>Preview not available for this file type.</p>`;
+                }
+            } else {
+                content.innerHTML = `<p class="text-danger">Failed to load preview: ${data.message}</p>`;
+            }
+        })
+        .catch(error => {
+            content.innerHTML = `<p class="text-danger">Error loading preview.</p>`;
+            console.error('Preview error:', error);
+        });
+}
+
+// Initialize page
+document.addEventListener('DOMContentLoaded', function() {
+    const commentsTextarea = document.getElementById('comments');
+    const commentsCount = document.getElementById('commentsCount');
+    
+    // Character count for comments
+    function updateCommentsCount() {
+        const count = commentsTextarea.value.length;
+        commentsCount.textContent = count;
+        
+        if (count > 900) {
+            commentsCount.className = 'text-warning';
+        } else if (count > 950) {
+            commentsCount.className = 'text-danger';
+        } else {
+            commentsCount.className = 'text-muted';
+        }
+        
+        // Update submit button state
+        updateSubmitButton();
+    }
+    
+    commentsTextarea.addEventListener('input', updateCommentsCount);
+    
+    // Initialize tooltips
+    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+    tooltipTriggerList.map(function (tooltipTriggerEl) {
+        return new bootstrap.Tooltip(tooltipTriggerEl);
+    });
+    
+    // Form submission
+    document.getElementById('approvalForm').addEventListener('submit', function(e) {
+        if (!selectedDecision) {
+            e.preventDefault();
+            alert('Please select your decision (Approve or Reject).');
+            return false;
+        }
+        
+        if (selectedDecision === 'rejected' && !commentsTextarea.value.trim()) {
+            e.preventDefault();
+            alert('Comments are required when rejecting a request.');
+            commentsTextarea.focus();
+            return false;
+        }
+        
+        // Show loading state
+        const submitBtn = document.getElementById('submitBtn');
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Processing...';
+    });
+    
+    // Auto-save draft decision
+    let autoSaveTimer;
+    function autoSave() {
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(() => {
+            if (selectedDecision && commentsTextarea.value.trim()) {
+                localStorage.setItem(`approval_draft_${<?php echo $requestData['id']; ?>}`, JSON.stringify({
+                    decision: selectedDecision,
+                    comments: commentsTextarea.value,
+                    timestamp: Date.now()
+                }));
+            }
+        }, 2000);
+    }
+    
+    // Load draft if exists
+    const draftKey = `approval_draft_${<?php echo $requestData['id']; ?>}`;
+    const draft = localStorage.getItem(draftKey);
+    if (draft) {
+        try {
+            const draftData = JSON.parse(draft);
+            // Only load if draft is less than 1 hour old
+            if (Date.now() - draftData.timestamp < 3600000) {
+                selectDecision(draftData.decision);
+                commentsTextarea.value = draftData.comments;
+                updateCommentsCount();
+            } else {
+                localStorage.removeItem(draftKey);
+            }
+        } catch (e) {
+            localStorage.removeItem(draftKey);
+        }
+    }
+    
+    // Set up auto-save
+    commentsTextarea.addEventListener('input', autoSave);
+    
+    // Clear draft on successful submission
+    window.addEventListener('beforeunload', function() {
+        if (selectedDecision && commentsTextarea.value.trim()) {
+            autoSave();
+        }
+    });
+});
+</script>
+
+<?php include '../includes/footer.php'; ?>

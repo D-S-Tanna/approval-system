@@ -1,0 +1,281 @@
+<?php
+/**
+ * Approval Handler (AJAX)
+ * File: approvals/approval-handler.php
+ */
+
+require_once '../config/config.php';
+require_once '../includes/session.php';
+require_once '../classes/Approval.php';
+
+// Ensure user is director
+requireRole([ROLE_DIRECTOR]);
+
+// Set JSON response header
+header('Content-Type: application/json');
+
+// Only allow POST requests
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['success' => false, 'message' => 'Method not allowed']);
+    exit();
+}
+
+$currentUser = getCurrentUser();
+$approval = new Approval();
+
+try {
+    // Get JSON input
+    $input = json_decode(file_get_contents('php://input'), true);
+    
+    if (!$input) {
+        throw new Exception('Invalid JSON input');
+    }
+    
+    $action = $input['action'] ?? '';
+    
+    switch ($action) {
+        case 'process_decision':
+            handleProcessDecision($approval, $currentUser, $input);
+            break;
+            
+        case 'bulk_process':
+            handleBulkProcess($approval, $currentUser, $input);
+            break;
+            
+        case 'request_info':
+            handleRequestInfo($currentUser, $input);
+            break;
+            
+        default:
+            throw new Exception('Invalid action');
+    }
+    
+} catch (Exception $e) {
+    error_log("Approval handler error: " . $e->getMessage());
+    echo json_encode([
+        'success' => false,
+        'message' => $e->getMessage()
+    ]);
+}
+
+/**
+ * Handle single approval decision
+ */
+function handleProcessDecision($approval, $currentUser, $input) {
+    $requestId = intval($input['request_id'] ?? 0);
+    $decision = sanitize($input['decision'] ?? '');
+    $comments = sanitize($input['comments'] ?? '');
+    
+    // Validate inputs
+    if (!$requestId) {
+        throw new Exception('Invalid request ID');
+    }
+    
+    if (!in_array($decision, ['approved', 'rejected'])) {
+        throw new Exception('Invalid decision');
+    }
+    
+    if ($decision === 'rejected' && empty(trim($comments))) {
+        throw new Exception('Comments are required for rejection');
+    }
+    
+    // Process the decision
+    $result = $approval->processDecision($requestId, $currentUser['id'], $decision, $comments);
+    
+    if ($result['success']) {
+        // Log the action
+        logActivity("Approval decision: {$decision} for request ID {$requestId}", 'INFO', [
+            'request_id' => $requestId,
+            'decision' => $decision,
+            'comments' => $comments
+        ]);
+    }
+    
+    echo json_encode($result);
+}
+
+/**
+ * Handle bulk approval processing
+ */
+function handleBulkProcess($approval, $currentUser, $input) {
+    $requestIds = $input['request_ids'] ?? [];
+    $decision = sanitize($input['decision'] ?? '');
+    $comments = sanitize($input['comments'] ?? '');
+    
+    // Validate inputs
+    if (empty($requestIds) || !is_array($requestIds)) {
+        throw new Exception('Invalid request IDs');
+    }
+    
+    if (!in_array($decision, ['approved', 'rejected'])) {
+        throw new Exception('Invalid decision');
+    }
+    
+    if ($decision === 'rejected' && empty(trim($comments))) {
+        throw new Exception('Comments are required for bulk rejection');
+    }
+    
+    // Limit bulk operations
+    if (count($requestIds) > 50) {
+        throw new Exception('Too many requests selected. Maximum 50 requests at once.');
+    }
+    
+    // Validate all request IDs are integers
+    $requestIds = array_map('intval', $requestIds);
+    $requestIds = array_filter($requestIds, function($id) { return $id > 0; });
+    
+    if (empty($requestIds)) {
+        throw new Exception('No valid request IDs provided');
+    }
+    
+    // Process bulk approval
+    $result = $approval->bulkProcess($requestIds, $currentUser['id'], $decision, $comments);
+    
+    if ($result['success']) {
+        // Log the bulk action
+        logActivity("Bulk approval: {$decision} for " . count($requestIds) . " requests", 'INFO', [
+            'request_ids' => $requestIds,
+            'decision' => $decision,
+            'comments' => $comments,
+            'success_count' => $result['success_count'],
+            'error_count' => $result['error_count']
+        ]);
+    }
+    
+    echo json_encode($result);
+}
+
+/**
+ * Handle request for more information
+ */
+function handleRequestInfo($currentUser, $input) {
+    $requestId = intval($input['request_id'] ?? 0);
+    $message = sanitize($input['message'] ?? '');
+    
+    // Validate inputs
+    if (!$requestId) {
+        throw new Exception('Invalid request ID');
+    }
+    
+    if (empty(trim($message))) {
+        throw new Exception('Message is required');
+    }
+    
+    $db = new Database();
+    
+    // Get request details
+    $requestQuery = "
+        SELECT fr.*, u.id as user_id, u.email, u.first_name, u.last_name
+        FROM financial_requests fr
+        JOIN users u ON fr.user_id = u.id
+        WHERE fr.id = :request_id
+    ";
+    
+    $db->query($requestQuery);
+    $db->bind(':request_id', $requestId);
+    $request = $db->single();
+    
+    if (!$request) {
+        throw new Exception('Request not found');
+    }
+    
+    // Check if user has approval rights for this request
+    $approvalCheck = $db->select('request_approvals', 
+        'request_id = :request_id AND approver_id = :approver_id', 
+        [':request_id' => $requestId, ':approver_id' => $currentUser['id']]
+    );
+    
+    if (empty($approvalCheck)) {
+        throw new Exception('You are not assigned to approve this request');
+    }
+    
+    // Create notification for the requester
+    $notification = new Notification();
+    $title = 'Additional Information Requested';
+    $notificationMessage = "Director {$currentUser['full_name']} has requested additional information for your request #{$request['request_number']}: {$message}";
+    
+    $notification->create($request['user_id'], NOTIFICATION_SYSTEM_ALERT, $title, $notificationMessage, $requestId);
+    
+    // Send email notification
+    $emailSubject = APP_NAME . " - Additional Information Requested";
+    $emailData = [
+        'requester_name' => $request['first_name'],
+        'director_name' => $currentUser['full_name'],
+        'request' => $request,
+        'message' => $message,
+        'action_url' => APP_URL . "/requests/view-request.php?id=" . $requestId
+    ];
+    
+    $emailBody = generateInfoRequestEmail($emailData);
+    $notification->sendEmail($request['email'], $emailSubject, $emailBody);
+    
+    // Log the action
+    logActivity("Requested additional information for request ID {$requestId}", 'INFO', [
+        'request_id' => $requestId,
+        'message' => $message,
+        'requester_id' => $request['user_id']
+    ]);
+    
+    echo json_encode([
+        'success' => true,
+        'message' => 'Information request sent to employee'
+    ]);
+}
+
+/**
+ * Generate email template for information request
+ */
+function generateInfoRequestEmail($data) {
+    return "
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset='UTF-8'>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f4f4f4; }
+            .container { max-width: 600px; margin: 0 auto; background: white; }
+            .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center; }
+            .content { padding: 30px; }
+            .footer { background: #f8f9fa; padding: 20px; text-align: center; font-size: 14px; color: #666; }
+            .button { display: inline-block; padding: 12px 30px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+            .info-request { background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 5px; margin: 15px 0; }
+            .highlight { color: #667eea; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class='container'>
+            <div class='header'>
+                <h1>" . APP_NAME . "</h1>
+                <p>Additional Information Requested</p>
+            </div>
+            <div class='content'>
+                <h2>Hello {$data['requester_name']},</h2>
+                <p>Director <strong>{$data['director_name']}</strong> has reviewed your financial request and needs additional information before making a decision.</p>
+                
+                <div class='info-request'>
+                    <h4>Request Details:</h4>
+                    <p><strong>Request Number:</strong> {$data['request']['request_number']}</p>
+                    <p><strong>Title:</strong> {$data['request']['title']}</p>
+                    <p><strong>Amount:</strong> <span class='highlight'>" . formatCurrency($data['request']['amount']) . "</span></p>
+                </div>
+                
+                <div class='info-request'>
+                    <h4>Information Requested:</h4>
+                    <p><em>\"{$data['message']}\"</em></p>
+                </div>
+                
+                <p>Please provide the requested information by replying to this email or updating your request directly in the system.</p>
+                <p><a href='{$data['action_url']}' class='button'>View Request</a></p>
+                
+                <p>Once you provide the additional information, the approval process will continue.</p>
+            </div>
+            <div class='footer'>
+                <p>This is an automated message from " . APP_NAME . "</p>
+                <p>Please do not reply directly to this email.</p>
+            </div>
+        </div>
+    </body>
+    </html>";
+}
+?>
